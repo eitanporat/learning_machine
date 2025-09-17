@@ -1,20 +1,30 @@
 import sys
 import time
 import jax
-from transformers import AutoModelForCausalLM, AutoTokenizer, StaticCache
+from transformers import AutoModelForCausalLM, AutoTokenizer, QuantizedCache, StaticCache
 import torchax as tx
 from torchax.interop import torch_view
 
 from jax.sharding import PartitionSpec as P, NamedSharding
 import torch
 
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-model_inputs = tokenizer(["The secret to baking a good cake is "], return_tensors="pt")
+import os
+
+os.environ['JAX_DEFAULT_DTYPE_BITS'] = '16'
+jax.config.update('jax_default_prng_impl', 'rbg')
+jax.config.update('jax_default_matmul_precision', 'bfloat16')
+
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B")
+model_inputs = tokenizer(["lorem ipsum " * 1024] * 192, return_tensors="pt")
 print(model_inputs)
 
-mesh = jax.make_mesh((jax.device_count(), ), ('axis', ))
+mesh = jax.make_mesh((4, 1), ('data', 'fsdp'))
 env = tx.default_env()
 
+env._mesh = mesh
+env.config.use_tpu_flash_attention = False
+env.config.shmap_flash_attention = False
 
 # added later
 from jax.tree_util import register_pytree_node
@@ -78,23 +88,41 @@ register_pytree_node(
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-2-7b-hf", 
+        "Qwen/Qwen2.5-7B", 
         dtype="bfloat16", device_map="cpu")
-        
+
+model.config.use_flash_attention_2 = False
+
+from jetstream_pt.quantize_model import quantize_model
+from jetstream_pt.environment import QuantizationConfig
+
+quantization_config = QuantizationConfig(
+  enable_weight_quantization=True,
+  enable_kv_quantization=True,
+)
+
+# model = quantize_model(model, quantization_config)
+
+# print(model)
+# import IPython; IPython.embed()
+
 def shard_weights_llama(mesh, weights):
   result = {}
   for k, v in weights.items():
-    if (('q_proj' in k) or 
+    print(k)
+    if 'weight_scaler' in k or 'bias' in k:
+      sharding = P()
+    elif (('q_proj' in k) or 
        ('k_proj' in k) or 
        ('v_proj' in k) or 
        ('gate_proj' in k) or 
        ('up_proj' in k)):
-      sharding = P('axis', None)
+      sharding = P('fsdp', None)
     elif(('o_proj' in k) or 
        ('down_proj' in k) or 
        ('lm_head.weight' in k) or 
        ('embed_tokens' in k)):
-      sharding = P(None, 'axis')
+      sharding = P(None, 'fsdp')
     else:
       sharding = P() # replicated
 
@@ -197,22 +225,25 @@ def autoregressive_decode_static(model, input_ids, tokenizer, attention_mask, ma
   #jitted = decode_one_tokens
 
   batch_size, seq_length = input_ids.shape
+  print(f"{batch_size=} {seq_length=}")
   model_weights = model.state_dict()
   
-  max_cache_len = seq_length + max_tokens
+  import math
+  max_cache_len = math.ceil((seq_length + max_tokens)/512)*512
+
+  batch_size, seq_length = input_ids.shape
 
   with torch.no_grad():
     start = time.perf_counter()
-    max_batch_size = 1
+    generated_ids = torch.zeros((batch_size, max_tokens), dtype=torch.long, device='jax')
     past_key_values = StaticCache(
         config=model.config, 
-        max_batch_size=max_batch_size, max_cache_len=max_cache_len, 
+        max_batch_size=batch_size, max_cache_len=max_cache_len, 
         device='jax', dtype=model.dtype
     )
 
     past_key_values._config = model.config # keep this
     cache_position = torch.arange(seq_length, device='jax')
-    generated_ids = torch.zeros((batch_size, max_tokens), dtype=torch.long, device='jax')
     
     logits, past_key_values = prefill_jitted(
         model_weights=model_weights,
@@ -226,7 +257,7 @@ def autoregressive_decode_static(model, input_ids, tokenizer, attention_mask, ma
     generated_ids[:, 0] = next_token.squeeze(-1)
 
     for layer in past_key_values.layers:
-      sharding_spec = P(None, 'axis', None, None)
+      sharding_spec = P('data', 'fsdp', None, None)
       layer.keys = layer.keys.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
       layer.values = layer.values.apply_jax_(jax.device_put, NamedSharding(mesh, sharding_spec)) # shard on num of head
     
@@ -239,7 +270,6 @@ def autoregressive_decode_static(model, input_ids, tokenizer, attention_mask, ma
           next_token.clone(), None, cache_position, past_key_values)
         generated_ids[:, i] = next_token.squeeze(-1)
         cache_position += 1
-        
         print('Iteration', i, ' took ', time.perf_counter() - iter_time)
     end = time.perf_counter()
 
@@ -257,11 +287,11 @@ with env:
   model.load_state_dict(weights, assign=True, strict=False)
   input_ids = model_inputs.input_ids.to('jax').apply_jax_(
     jax.device_put,
-    NamedSharding(mesh, P()))
+    NamedSharding(mesh, P('data', None)))
   
   attention_mask = model_inputs.attention_mask.to('jax').apply_jax_(
       jax.device_put,
-      NamedSharding(mesh, P())
+      NamedSharding(mesh, P('data', None))
   )
 
   tx.interop.call_jax(jax.block_until_ready, (weights, input_ids, attention_mask))
